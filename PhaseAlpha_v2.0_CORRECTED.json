@@ -1,0 +1,1120 @@
+{
+  "name": "PhaseAlpha v2.0 - Mechanical Schedule Extraction Pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## 🟠 MERGE + COMPARISON AGENT\nMerge waits for both branches. Comparison Agent receives SOURCE_A (LlamaParse JSON), SOURCE_B (Claude JSON), and SOURCE_OF_TRUTH (Parse markdown). Runs 8-step comparison with source-of-truth-first arbitration.",
+        "height": 140,
+        "width": 1120,
+        "color": 2
+      },
+      "id": "3332fa9c-1bc2-4c32-96f4-15e3bfbe3e2b",
+      "name": "Sticky - Merge + Compare",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1648,
+        5200
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "anthropicApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "content-type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.request_body) }}",
+        "options": {
+          "timeout": 900000
+        }
+      },
+      "id": "1392a381-2ef0-4848-967c-27acd6a2c2d7",
+      "name": "Comparison Agent",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2256,
+        5536
+      ],
+      "credentials": {
+        "anthropicApi": {
+          "id": "je1vli3fFL5A38FY",
+          "name": "PhaseAlpha Claude API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Prepare Comparison Agent API request body\nconst items = $input.all();\n\n// LlamaParse data (from Prepare LlamaParse Output)\nconst llamaData = items[0].json;\nconst llamaparse_extract = llamaData.llamaparse_extract;\nconst llamaparse_markdown = llamaData.llamaparse_markdown;\n\n// Claude data (from Claude Direct Extract HTTP response)\nconst claudeData = items[1].json;\nlet claude_extract = '';\nif (claudeData.content && Array.isArray(claudeData.content)) {\n  claude_extract = claudeData.content.map(b => b.text || '').join('');\n} else {\n  claude_extract = JSON.stringify(claudeData);\n}\n\nlet claude_parsed;\ntry {\n  claude_parsed = JSON.parse(claude_extract);\n} catch(e) {\n  claude_parsed = { raw_text: claude_extract, parse_error: e.message };\n}\n\nconst systemPrompt = `You are the PhaseAlpha Comparison Agent. Your job is to compare two independent extractions of the same mechanical equipment schedule drawing — and validate both against a source of truth — then produce a single merged output that is more accurate than either source alone.\n\nYou will receive three inputs:\n- SOURCE_A: LlamaParse Extract output (title/notes/table as HTML string)\n- SOURCE_B: Claude Extract output (schedule_title/notes/header_groups/columns/rows as named fields)\n- SOURCE_OF_TRUTH: The parsed markdown or PDF of the same drawing — the confirmed baseline\n\nOUTPUT: Return ONLY valid JSON — no explanation, no markdown, no HTML:\n\n{\n  \"extraction_summary\": {\n    \"source_a_schedules\": 0,\n    \"source_b_schedules\": 0,\n    \"matched_schedules\": 0,\n    \"source_a_only\": [],\n    \"source_b_only\": [],\n    \"flagged_for_review\": [],\n    \"accuracy_summary\": {\n      \"source_a\": \"overall %\",\n      \"source_b\": \"overall %\",\n      \"merged\": \"overall %\",\n      \"schedules_fully_correct\": 0,\n      \"schedules_with_conflicts\": 0,\n      \"schedules_requiring_human_review\": 0\n    }\n  },\n  \"mechanical_equipment_schedules\": [\n    {\n      \"schedule_title\": \"exact title\",\n      \"confidence\": \"high | medium | low\",\n      \"source\": \"both | source_a | source_b\",\n      \"accuracy\": {\n        \"source_a\": \"X/Y cells correct\",\n        \"source_b\": \"X/Y cells correct\",\n        \"merged\": \"X/Y cells correct\"\n      },\n      \"conflicts\": [],\n      \"tag_anomaly_note\": \"only if present — omit field entirely otherwise\",\n      \"known_limitation\": \"only if a known failure applies — omit field entirely otherwise\",\n      \"notes\": [],\n      \"columns\": [],\n      \"rows\": []\n    }\n  ]\n}\n\nSTEP 1 — MATCH SCHEDULES ACROSS BOTH SOURCES:\nMatch Source A and Source B schedule objects by title. Normalize for case and spacing.\nFor each matched pair proceed to Step 2.\nFor schedules in Source A only: include with source: \"source_a\", confidence: \"medium\".\nFor schedules in Source B only: include with source: \"source_b\", confidence: \"medium\".\n\nSTEP 2 — COMPARE ROW COUNTS:\nParse Source A HTML tbody row count. Get Source B rows array length.\nIf counts match: proceed to Step 3.\nIf Source A has more rows: use Source A as authoritative. Flag in conflicts.\nIf Source B has more rows: use Source B as authoritative. Flag in conflicts.\n\nSTEP 3 — ESTABLISH COLUMN STRUCTURE:\nUse Source B columns array and header_groups as the base column structure.\nIf Source A HTML contains colspan parent group headers not in Source B header_groups: add them.\nIf Source B has invented column names not matching any printed label: flag and default to Source A.\nThe merged columns array is the final authoritative column list.\n\nSTEP 4 — MERGE ROW DATA:\nCompare values cell by cell using the merged column structure.\n\nFor every cell where Source A and Source B have different non-null values, apply this sequence in strict order. Do not skip to arbitration rules if the source of truth resolves it.\n\n  4a. SOURCE OF TRUTH FIRST (always check this before any arbitration rule):\n      Look up this cell's value in SOURCE_OF_TRUTH.\n      If SOURCE_OF_TRUTH has a clearly readable value for this cell — use it. Record: \"Resolved via source of truth: [value].\" No further arbitration needed for this cell.\n      If SOURCE_OF_TRUTH is not clearly readable for this cell — proceed to 4b.\n\n  4b. ARBITRATION RULES (only when source of truth cannot resolve):\n\n    TAG COLUMN:\n      Source A has alphanumeric tag, Source B has ILLEGIBLE or numeric value — use Source A.\n      Source B has alphanumeric tag, Source A has numeric or garbled value — use Source B.\n      Both have different recognizable tags — check SERVICE column. If the SERVICE value unambiguously identifies the correct tag (e.g. SERVICE=\"INDIRECT HEATERS\" — TAG=\"IHP-1\"), use the source whose tag matches that service. Record: \"TAG resolved via SERVICE column cross-reference.\" If SERVICE does not resolve it, flag for human review and record both values.\n\n    MODEL NUMBERS:\n      Prefer the longer more complete value.\n      TRAILING CHARACTER DUPLICATION: If one source has a model number ending in a repeated final character (e.g. XX, DD) while the other source has a single character, the doubled version is a likely OCR duplication artifact. Prefer the single-character version and add to conflicts: \"Model trailing character duplication suspected — prefer [single-X version] — route to Layer 6b for verification.\"\n      If character substitution suspected (O vs 0, B vs 8): flag for human review. Record both. Route to Layer 6b.\n\n    NUMERIC DATA (CFM, GPM, MBH, HP, etc.):\n      Differ by less than 1% — use Source A, note minor variance.\n      Differ significantly — go back to step 4a and re-check source of truth. If still unresolved, flag for human review. Record both.\n\n    DIMENSION COLUMNS (W, H, LENGTH, DEPTH, HEIGHT, RECESS):\n      If one source shows a value that appears implausibly large for the equipment type (e.g. a louver W dimension exceeding 60\", a cabinet height exceeding 120\") do not auto-accept it. Go back to step 4a and re-check source of truth for this cell specifically. If source of truth confirms the large value, accept it. If source of truth confirms the smaller value, use that. If source of truth is unreadable, flag for human review.\n\n    PRESSURE RANGE VALUES (e.g. \"7-14\"):\n      Legitimate BURNER OPER PRESS (IN WC) specification — never a conflict.\n      Use whichever source placed it in the correct pressure column.\n\n    Both sources have ILLEGIBLE: return \"ILLEGIBLE\". Cell confidence: low.\n\nFor cells where one source has a value and the other has null or ILLEGIBLE:\n  Source B has value, Source A has null or ILLEGIBLE — use Source B value. No conflict.\n  Source A has value, Source B has ILLEGIBLE — use Source A value. Record: \"Source A provided [X] for [COLUMN] — Source B marked ILLEGIBLE.\"\n  Source A has value, Source B has null — use Source A value if column alignment is confirmed correct.\n\nSTEP 5 — SOURCE OF TRUTH SCORING:\nAfter merging all cells, compute accuracy scores by comparing each merged value against SOURCE_OF_TRUTH.\n\nExact match — confirmed: true.\nMismatch — add to conflicts: \"Merged value [X] does not match source of truth [Y] — Source A had [A_val], Source B had [B_val]\". Use source of truth value. Reduce confidence to low if TAG or MODEL is wrong.\nBoth sources wrong — flag for human review. Use source of truth value. Note: \"Neither source matched source of truth for this cell.\"\nSource of truth missing a value — keep merged value. Do not penalize.\n\nCompute per schedule: source_a cells correct / total, source_b cells correct / total, merged cells correct / total.\n\nSTEP 6 — KNOWN FAILURE HANDLING:\n\nBOILER BURNER OPERATING PRESSURE:\n\"7-14\" in BURNER OPER PRESS (IN WC) or OPER GAS PRESS (INWC) is legitimate data. Never flag as conflict.\n\nHYDRONIC HEATING UNITS — 6 ROWS:\nBoth sources return 6 rows (CUH1–CUH5, UH1). Do not flag as incomplete.\nAdd: \"known_limitation\": \"BERNER and STERLING RW rows not visible at source drawing resolution — route to Layer 6b.\"\n\nATU-3 TAG PREFIX:\nTags beginning with \"0-\" are a confirmed font rendering artifact. Extract exactly as printed.\nPreserve tag_anomaly_note from Source B. Add to Layer 6b routing: \"0-N tags require prefix correction to 3-N.\"\n\nPUMP TAG COLUMN:\nIf both sources return different recognizable tags for the same pump row, apply SERVICE column cross-reference first (Step 4b TAG COLUMN rule). Only return ILLEGIBLE if SERVICE column also fails to resolve the conflict.\nAdd: \"known_limitation\": \"Pump TAG column at drawing left margin — route to Layer 6b for model-based tag assignment if still unresolved.\"\n\nSTEP 7 — ASSIGN CONFIDENCE:\n\nhigh: Both sources found schedule. Row counts match. No unresolved conflicts. No ILLEGIBLE in TAG column.\nmedium: Row counts differ OR minor conflicts resolved by arbitration OR some ILLEGIBLE in non-critical columns.\nlow: Only one source found schedule OR TAG column has ILLEGIBLE OR unresolved conflicts OR significant row count difference.\n\nAdd all low-confidence schedules to extraction_summary.flagged_for_review.\n\nSTEP 8 — BUILD FINAL OUTPUT:\nFor each merged schedule output: schedule_title, confidence, source, accuracy, conflicts (empty array if none), tag_anomaly_note (omit if not applicable), known_limitation (omit if not applicable), notes (deduplicated in print order), columns (merged list from Step 3), rows (merged data from Steps 4 and 5).\n\nBuild extraction_summary with all counts and accuracy_summary percentages.\n\nCRITICAL RULES:\nNever invent data. If neither source has a value and source of truth is unreadable, return null.\nNever merge two different equipment rows into one.\nNever skip a row because it appears in only one source.\nNever change a tag value during merging — tag corrections happen in Layer 6b not here.\nNever add columns that appear in neither source.\nPreserve exact text, numbers, units, and model numbers from the source that provided the value.\nSOURCE OF TRUTH always takes precedence over arbitration rules when readable.\nProcess all schedules in top-to-bottom page order.\nOutput one merged object per schedule.\nThis agent must work on any mechanical schedule drawing regardless of engineering firm, project name, or drawing complexity.\n\n=== REFERENCE: OUTPUT SCHEMA ===\nPhaseAlpha_Output_Schema.json\n\nFormatting may be inconsistent from source\n\n{\n  \"description\": \"PhaseAlpha mechanical equipment schedule extraction output schema. Claude must match this structure exactly on every extraction.\",\n  \"root_fields\": {\n    \"incomplete\": {\n      \"type\": \"boolean\",\n      \"description\": \"Set to true only if schedules remain unextracted due to output size limits. Must be false when all schedules are complete.\",\n      \"default\": false\n    },\n    \"remaining_schedules\": {\n      \"type\": \"array\",\n      \"items\": {\"type\": \"string\"},\n      \"description\": \"List of schedule titles not yet output. Empty array when incomplete is false.\",\n      \"default\": []\n    },\n    \"mechanical_equipment_schedules\": {\n      \"type\": \"array\",\n      \"description\": \"One object per schedule table, in top-to-bottom page order.\",\n      \"items\": {\n        \"schedule_title\": {\n          \"type\": \"string\",\n          \"description\": \"Exact schedule title as printed on the drawing. Belongs only to the table directly beneath it. Never reused or merged with adjacent schedules.\"\n        },\n        \"tag_anomaly_note\": {\n          \"type\": \"string\",\n          \"description\": \"Include ONLY when a tag anomaly is detected — e.g. ATU-3 tags beginning with 0- when AHU-1 tags begin with 1- and AHU-2 tags begin with 2-. Omit this field entirely from all other schedules.\",\n          \"optional\": true\n        },\n        \"notes\": {\n          \"type\": \"array\",\n          \"items\": {\"type\": \"string\"},\n          \"description\": \"All notes and remarks exactly as printed, in print order. Each note appears exactly once. Return empty array if no notes exist. Never duplicate notes across adjacent schedules.\"\n        },\n        \"header_groups\": {\n          \"type\": \"array\",\n          \"description\": \"Parent group structure exactly as printed. One object per group.\",\n          \"items\": {\n            \"label\": {\n              \"type\": [\"string\", \"null\"],\n              \"description\": \"Parent group name exactly as printed, or null if columns have no parent group.\"\n            },\n            \"columns\": {\n              \"type\": \"array\",\n              \"items\": {\"type\": \"string\"},\n              \"description\": \"Sub-column names belonging to this group, exactly as printed.\"\n            }\n          }\n        },\n        \"columns\": {\n          \"type\": \"array\",\n          \"items\": {\"type\": \"string\"},\n          \"description\": \"Flat ordered list of all column names left to right. When the same sub-column name appears under multiple parent groups, prefix with parent group name using space separator — e.g. SUPPLY FAN DESIGN CFM, RETURN FAN DESIGN CFM.\"\n        },\n        \"rows\": {\n          \"type\": \"array\",\n          \"description\": \"One object per data row. Keys are column names from the columns array.\",\n          \"items\": {\n            \"type\": \"object\",\n            \"description\": \"Each key is a column name. Each value is a string, null, or ILLEGIBLE.\",\n            \"value_rules\": {\n              \"string\": \"Exact text, number, or symbol printed in the cell — copied verbatim.\",\n              \"null\": \"Cell is physically absent or completely blank — nothing printed.\",\n              \"ILLEGIBLE\": \"Something is visibly printed but cannot be read at current resolution.\"\n            }\n          }\n        }\n      }\n    }\n  }\n}\n\n=== REFERENCE: TAG IDENTIFICATION RULES ===\nPHASEАЛPHA TAG IDENTIFICATION RULES\nValidated 4/6/26\n\n═══════════════════════════════════════════════\nWHAT A VALID TAG LOOKS LIKE\n═══════════════════════════════════════════════\nTAG values are always alphanumeric equipment identifiers.\n\nValid TAG formats:\n  AHU-1, AHU-2, AHU-3\n  CUH1, CUH2, CUH3, CUH4, CUH5\n  UH1, UH2\n  CP-1, CP-2, CP-3, CP-4\n  HP-3, HP-4, HP-5, HP-6, HP-7\n  IHP-1\n  B-1, B-2\n  CH-1\n  EF-1 through EF-11\n  H-1, H-2, H-3\n  IH-1, IH-2, IH-3\n  AC-1, AC-2, AC-3\n  KH-1, KH-2\n  MAU-1\n  FFU-1, FFU-2, FFU-3\n  BC-1\n  CU-1\n  DC-1, DC-2, DC-3, DC-4\n  L-1, L-2\n  RP-1, EBB-1\n  S1, S2, S3, R1, R2, E1, T1\n  SV-1, EV-1\n  1-1 through 1-26 (ATU terminals for AHU-1)\n  2-1 through 2-29 (ATU terminals for AHU-2)\n  3-1 through 3-22 (ATU terminals for AHU-3, if correctly rendered)\n  0-1 through 0-22 (ATU terminals for AHU-3, drawing resolution artifact)\n\n═══════════════════════════════════════════════\nWHAT A TAG NEVER LOOKS LIKE\n═══════════════════════════════════════════════\nTAG values are NEVER:\n  - Decimal numbers: 0.4, 1.5, 2.0\n  - HP fractions: 1/15, 1/3, 1/2\n  - Wattage values: 620, 2200, 230\n  - CFM values: 18000, 15000\n  - Any pure number without a letter prefix or hyphen\n\nIf the leftmost visible column of a table contains values like 0.4, 1/15, 1/3,\nor other numeric-only entries, those are NOT tag values. A data column (typically\nHP or WATTS) has shifted into view before the TAG column. Re-examine the full\nrow structure to locate the correct TAG column.\n\n═══════════════════════════════════════════════\nILLEGIBLE THRESHOLD FOR TAG\n═══════════════════════════════════════════════\nTAG is the primary join key for all downstream PhaseAlpha systems.\nA wrong TAG corrupts all downstream joins.\nA null TAG tells the system the row does not exist.\nAn ILLEGIBLE TAG tells the system the row exists but needs resolution.\n\nRule: If a TAG cell cannot be read with high confidence, always return ILLEGIBLE.\nNever return null for a TAG when a row visibly exists.\nNever substitute an adjacent column's value as a tag.\n\n═══════════════════════════════════════════════\nSECTION DIVIDER ROWS\n═══════════════════════════════════════════════\nSome tables contain bold or visually distinct rows that label equipment subtypes\nrather than representing individual equipment. These are section dividers.\n\nExamples: CAB UNIT HTRS, UNIT HTRS, AIR CURTAINS, FAN COIL UNITS\n\nDo not extract section divider rows as data rows.\nExtract only rows that contain a valid TAG identifier in the first data column.\nThis rule applies to any schedule type — not only Hydronic schedules.\n\n═══════════════════════════════════════════════\nTAG ANOMALY FLAGGING\n═══════════════════════════════════════════════\nIf ATU terminal tags follow the pattern:\n  AHU-1 terminals: 1-1, 1-2, 1-3...\n  AHU-2 terminals: 2-1, 2-2, 2-3...\n  AHU-3 terminals: 0-1, 0-2, 0-3... (expected: 3-1, 3-2, 3-3...)\n\nThe 0- prefix on AHU-3 terminals is a confirmed drawing font rendering artifact.\nExtract the tags exactly as printed (0-1, 0-2, etc).\nAdd a tag_anomaly_note field to that schedule object only:\n  \"tag_anomaly_note\": \"0- prefix on AHU-3 tags may be a font rendering artifact — verify against drawing.\"\nOmit tag_anomaly_note from all other schedules.\n\n=== REFERENCE: KNOWN FAILURES AND ROUTING ===\nPHASEАЛPHA KNOWN FAILURES AND ROUTING\nValidated 4/6/26 — Do not attempt to fix these with prompt changes.\n\n═══════════════════════════════════════════════\nru6 — RETIRED\n═══════════════════════════════════════════════\nORIGINAL CLASSIFICATION: Boiler \"7-14\" note reference contamination\nSTATUS: RETIRED — was a misclassification\n\nFINDING: \"7-14\" in the boiler schedule is the legitimate BURNER OPERATING PRESSURE\nspecification in inches water column (7 to 14 in WC). It belongs in the\nBURNER OPER PRESS (IN WC) or OPER GAS PRESS (INWC) column.\nConfirmed by both LlamaParse and Claude independently.\n\nCORRECT EXTRACTION: Extract \"7-14\" in the pressure column exactly as printed.\nDo not flag, do not route to error handling.\n\n═══════════════════════════════════════════════\nru7a — ATU-3 TAG PREFIX\n═══════════════════════════════════════════════\nFAILURE: AHU-3 terminal unit tags read as 0-1, 0-2... instead of 3-1, 3-2...\nCAUSE: Drawing font rendering at this resolution — the digit \"3\" is read as \"0\"\nCONFIRMED: Fails identically across LlamaParse and Claude — not a prompt issue\nSTATUS: Drawing resolution failure — do not attempt to fix at extraction level\n\nCORRECT HANDLING:\n  Extract tags exactly as printed: 0-1, 0-2, etc.\n  Add tag_anomaly_note to AHU-3 schedule object only.\n  Layer 6b downstream applies correction mapping: 0-N → 3-N\n\n═══════════════════════════════════════════════\nru7b — HYDRONIC BERNER/RW MISSING ROWS\n═══════════════════════════════════════════════\nFAILURE: BERNER AHD10-2072W, AHD10-2060W and STERLING RW02, RW03 rows\nmissing from HYDRONIC HEATING UNITS schedule\nCAUSE: Drawing resolution — these equipment subtypes look visually different\nfrom the MODINE/STERLING CUH rows and are not detected at this DPI\nCONFIRMED: Fails across all 8 LlamaParse runs and both Claude runs\nSTATUS: Drawing resolution failure — do not attempt to fix at extraction level\n\nCORRECT HANDLING:\n  Extract the 6 rows that are visible: CUH1, CUH2, CUH3, CUH4, CUH5, UH1\n  Layer 6b downstream applies correction mapping for known missing rows\n\n═══════════════════════════════════════════════\nru7c — PUMP TAG COLUMN VISIBILITY\n═══════════════════════════════════════════════\nFAILURE: PUMP schedule TAG column falls at or beyond the left edge of the\ndrawing page as rendered — tags cannot be confirmed\nCAUSE: Drawing layout — the TAG column is physically at the far left margin\nSTATUS: Drawing layout failure\n\nCORRECT HANDLING:\n  Extract TAG as ILLEGIBLE for all pump rows\n  Extract all other pump data (GPM, FT HD, BHP/HP, MODEL, etc.) normally\n  Layer 6b cross-references pump model numbers to assign correct tags\n\n═══════════════════════════════════════════════\nGENERAL RULE\n═══════════════════════════════════════════════\nAfter 3 failed extraction attempts on the same failure pattern,\nclassify as a drawing-resolution failure and route to Layer 6b.\nDo not add new prompt rules to chase unfixable drawing-level issues.`;\n\nconst userMessage = \"SOURCE_A:\\n\" + JSON.stringify(llamaparse_extract) + \"\\n\\nSOURCE_B:\\n\" + JSON.stringify(claude_parsed) + \"\\n\\nSOURCE_OF_TRUTH:\\n\" + (llamaparse_markdown || \"Not available\");\n\nconst requestBody = {\n  model: \"claude-sonnet-4-6\",\n  max_tokens: 16000,\n  system: [{ type: \"text\", text: systemPrompt, cache_control: { type: \"ephemeral\" } }],\n  messages: [\n    {\n      role: \"user\",\n      content: userMessage\n    }\n  ]\n};\n\nreturn [{\n  json: {\n    request_body: requestBody,\n    file_url: llamaData.file_url,\n    project_name: llamaData.project_name,\n    drawing_number: llamaData.drawing_number\n  }\n}];"
+      },
+      "id": "0fc9686c-10f1-4d3f-801c-826c34fb3ea2",
+      "name": "Prepare Comparison Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2032,
+        5552
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "phasealpha-extract",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "id": "ac283f5b-c9d7-49f5-915d-908f1594a988",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -576,
+        10976
+      ],
+      "webhookId": "c4af23b3-f08e-4586-934e-567ac7ba9926"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extract file binary + metadata from webhook payload\nconst input = $input.first();\nconst json = input.json;\nconst binary = input.binary;\n\n// Get metadata from form fields or JSON body\nconst projectName = json.project_name || json.projectName || 'Unknown Project';\nconst drawingNumber = json.drawing_number || json.drawingNumber || 'Unknown';\nconst fileName = json.file_name || json.fileName || 'drawing.pdf';\n\n// Check if we have binary data (file upload) or a URL\nlet hasFile = false;\nlet fileUrl = json.file_url || json.fileUrl || json.url || '';\n\nif (binary && binary.data) {\n  hasFile = true;\n} else if (binary && binary.file) {\n  hasFile = true;\n}\n\nif (!hasFile && !fileUrl) {\n  throw new Error('No PDF file or file_url provided in webhook payload. Send a multipart/form-data POST with a \"data\" or \"file\" field containing the PDF.');\n}\n\n// Convert binary to base64 for Claude API\nlet base64Data = '';\nlet mimeType = 'application/pdf';\nif (hasFile) {\n  const binaryKey = binary.data ? 'data' : 'file';\n  base64Data = binary[binaryKey].data; // n8n stores binary as base64 already\n  mimeType = binary[binaryKey].mimeType || 'application/pdf';\n}\n\nreturn [{\n  json: {\n    has_file: hasFile,\n    file_url: fileUrl,\n    base64_data: base64Data,\n    mime_type: mimeType,\n    file_name: fileName,\n    project_name: projectName,\n    drawing_number: drawingNumber\n  },\n  binary: input.binary  // Pass binary through for LlamaParse upload\n}];"
+      },
+      "id": "300c3418-e247-4969-b64e-a6c90e65d516",
+      "name": "Extract File Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -384,
+        10976
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Prepare data for LlamaParse upload\n// Pass through binary + metadata\nconst input = $input.first();\nconst fileData = input.json;\n\nreturn [{\n  json: {\n    has_file: fileData.has_file,\n    file_url: fileData.file_url,\n    file_name: fileData.file_name,\n    project_name: fileData.project_name,\n    drawing_number: fileData.drawing_number\n  },\n  binary: (() => {\n    const bin = input.binary || {};\n    const keys = Object.keys(bin);\n    if (keys.length > 0) {\n      return { data: bin[keys[0]] };\n    }\n    return {};\n  })()\n}];"
+      },
+      "id": "6bc44802-91fd-40f0-9b5b-8538e4255ce6",
+      "name": "Prepare LlamaParse Upload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -176,
+        11408
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.cloud.llamaindex.ai/api/v1/parsing/upload",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "file",
+              "inputDataFieldName": "data"
+            },
+            {
+              "name": "parsing_instruction",
+              "value": "You are an expert at extracting complex HVAC and mechanical equipment schedules from construction drawings.\n\nThe input is a drawing sheet that contains one or more equipment schedule tables.\n\nFollow this exact process:\n1. Use layout detection to identify every individual schedule table on the page, including small, tightly packed, or specialty schedules such as LOUVERS, DUCT CONSTRUCTION, ELECTRIC HEATING UNITS, BLOWER COIL UNITS, HEPA FAN FILTER UNITS, and AIR TERMINAL UNIT - AIR VALVES. Dense pages may contain 20+ schedules. Every named table must be found and extracted as its own independent section.\n2. For each detected table, generate one clean layout image/crop containing ONLY that single table.\n3. Then extract each table using this exact format:\n\n### [Exact Schedule Title as it appears in the drawing]\n\n**Notes / Remarks:**\nCopy every note and remark exactly as written, including numbering, in the exact order they are printed.\n- Each numbered note must appear exactly once\n- Never duplicate notes\n- If none, write \"None\"\n- Note reference numbers (e.g., \"1,2,3\" or \"7-14\") must NEVER be placed inside data cells\n\n**Extracted Table:**\nOutput the table as proper HTML table code only (<table>, <thead>, <tr>, <th>, <tbody>, <td>).\nUse true multi-row headers with colspan and rowspan for hierarchical parent groups.\nDo not use Markdown tables.\nDo not use <br/> anywhere in the output.\nFirst header row: Broad parent category groups exactly as printed on the drawing.\nSecond header row: All detailed sub-columns exactly as printed with full units and labels.\nThe lists of headers provided are guidance only and must never override what is actually printed on the drawing.\n\nSCHEDULE BOUNDARIES (CRITICAL):\nEvery schedule is fully independent. Never merge data from adjacent schedules. Never borrow columns, rows, or header labels from a neighboring table. The title of each section must match the exact table it belongs to.\n\nNULL RULES (HIGHEST PRIORITY):\n- Use null ONLY for cells that are truly unreadable or physically absent.\n- NEVER calculate, infer, interpolate, or derive any value.\n- NEVER shift data from one column to an adjacent column.\n- Note reference numbers that appear at the end of a row (e.g. \"1,2,3\" or \"7-14\") belong in the NOTES or REQ'D ACCESS column ONLY — never in electrical, CFM, GPM, MBH, model number, or any other data field.\n\nStrict Rules (HIGHEST PRIORITY):\n- Perfect column alignment and correct colspan/rowspan on every parent header.\n- Extract every single data row completely without skipping or summarizing.\n- For schedules with mixed equipment subtypes (e.g. CAB UNIT HTRS + UNIT HTRS + AIR CURTAINS in one table), extract ALL rows for ALL subtypes — do not stop after the first subtype.\n- Model numbers must be copied exactly as printed. Never reformat, abbreviate, or add separators.\n- Tag identifiers must be read exactly as printed — never substitute visually similar digits.\n- SYMBOL and AREA SERVED are always separate columns — never merge into one cell.\n- If a schedule is printed in transposed format (attributes as rows, unit tags as columns), preserve that transposed structure exactly — do not rotate or reformat.\n\nPARENT GROUP GUIDANCE (use exact labels from drawing, these are examples only):\nSUPPLY FAN, RETURN FAN, EXHAUST FAN, RELIEF FAN, COOLING COIL, HEATING COIL, PREHEAT COIL, REHEAT COIL, PRE-FILTER, FINAL FILTER, ENTHALPY WHEEL / ENERGY RECOVERY WHEEL, ELECTRICAL, MOTOR DATA, CAPACITY DATA, CONNECTION SIZE, CABINET DIMENSIONS, INDOOR UNIT ELECTRICAL, OUTDOOR UNIT ELECTRICAL, HEATING CAPACITY, COOLING CAPACITY, FAN MOTOR DATA, WHEEL DATA\n\nSUB-COLUMN GUIDANCE (use exact labels from drawing, these are common examples):\nCFM, GPM, MBH, TONS, RPM, HP, BHP, FLA, MCA, MOCP, VOLTS, PHASE, EWT °F, LWT °F, EAT °F, LAT °F, ESP (IN WC), TSP, PD FT, APD (IN WC), WPD (FT), ROWS, # OF COILS, OUTLET VEL-FPM, MERV RATING, P.D. IN. W.C. CLEAN/DIRTY, FACE DIMENSIONS, FACE AREA (SF), RUNOUT SIZE (IN), INLET DIA (IN), MAX CFM, MIN CFM, SONES, DIA (IN), MAX NC RAD, MAX NC DIS, RNOUT SIZE, MAX PD (FT), NOM. TONS, SEER, NO. OF CIRCUITS, RECOV. (GPH), CAP. (GAL), MIN LOAD MBH/HR, STANDBY LOSS °F/HR, lb/hr, NUMBER OF TUBES, DUCT SIZE W\"xH\", FREE AREA (SF), AIR FLOW PD (IN), DP (IN), W (IN), H (IN), LENGTH, DEPTH, HEIGHT, RECESS, SUCT, DISCH, BHP/HP, EFF %, STATIC PRESS, FAN CONTROL BY, SERVICE/LOCATION, MAX dBA, MODULE SIZE, FAN HP, MOUNTING, DESCRIPTION, TYPE, COIL TYPE, NO OF ROWS, FACE DIMENSIONS, EAT DB, EAT WB, LAT DB, LAT WB, SENS, TOTAL, KW, GAS INPUT MBH, GAS OUTPUT MBH, FAN DIA, FAN RPM, STAT PRESS (ESP IN), VOLTS/PH, FILTER FACE AREA (SF), MT'G HGT AFF, FULL (CFM), EXH CONN SIZE (IN), SUPPLY CONN SIZE (IN), APPROX DIMENSIONS (IN), NOTES, REQ'D ACCESS\n\nProcess all tables from top to bottom. Output one clean section per table.\nThis prompt must work on any mechanical schedule sheet regardless of project name, page number, or file name."
+            },
+            {
+              "name": "result_type",
+              "value": "markdown"
+            },
+            {
+              "name": "merge_continued_tables",
+              "value": "true"
+            },
+            {
+              "name": "page_screenshots",
+              "value": "true"
+            },
+            {
+              "name": "layout_images",
+              "value": "true"
+            },
+            {
+              "name": "preserve_layout_alignment",
+              "value": "true"
+            },
+            {
+              "name": "preserve_very_small_text",
+              "value": "true"
+            },
+            {
+              "name": "max_pages",
+              "value": "20"
+            },
+            {
+              "name": "output_tables_as_markdown",
+              "value": "false"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "7df38ec4-93f4-4845-8fbe-e7702b40ed9d",
+      "name": "Submit Parse Job",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        64,
+        11408
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "zHcdy6Tmcs7XIdS8",
+          "name": "Llama APIHeader"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "amount": 2,
+        "unit": "minutes"
+      },
+      "id": "ca9d82d9-5422-433d-9bda-313a9f56ebc2",
+      "name": "Wait Parse 2min",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        272,
+        11408
+      ],
+      "webhookId": "4b53ca8f-7808-4916-842a-add07feeb0f8"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Poll Counter — LlamaParse Parse Job\nconst items = $input.all();\nconst item = items[0].json;\nconst pollCount = (item.poll_count || 0) + 1;\nconst maxPolls = 15;\nconst jobId = item.id || item.job_id || $('Submit Parse Job').first().json.id;\n\nif (pollCount > maxPolls) {\n  throw new Error('LlamaParse Parse job timed out after ' + maxPolls + ' polls. Job ID: ' + jobId);\n}\n\nreturn [{\n  json: {\n    ...item,\n    job_id: jobId,\n    poll_count: pollCount,\n    max_polls: maxPolls,\n    poll_exceeded: pollCount > maxPolls\n  }\n}];"
+      },
+      "id": "5c7068e2-0a95-44cd-beb8-0933b3d02ba1",
+      "name": "Poll Counter Parse",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        11408
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://api.cloud.llamaindex.ai/api/v1/parsing/job/{{ $('Poll Counter Parse').first().json.job_id }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "b9ccf555-1232-40c6-acfd-5cb4c330432e",
+      "name": "Check Parse Status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        688,
+        11408
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "zHcdy6Tmcs7XIdS8",
+          "name": "Llama APIHeader"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "0ab2c898-9432-48df-9d83-ebc46089ac32",
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "SUCCESS",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "fd9a467c-7d0b-4ef0-ad7a-f96272d30a79",
+      "name": "Parse Job Complete?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        896,
+        11408
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://api.cloud.llamaindex.ai/api/v1/parsing/job/{{ $('Poll Counter Parse').first().json.job_id }}/result/markdown",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "419bb133-e8fc-4a1e-815d-ea0950362c74",
+      "name": "Get Parse Markdown",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1104,
+        11264
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "zHcdy6Tmcs7XIdS8",
+          "name": "Llama APIHeader"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.cloud.llamaindex.ai/api/v1/parsing/upload",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "file",
+              "inputDataFieldName": "data"
+            },
+            {
+              "name": "parsing_instruction",
+              "value": "You are an expert at extracting complex HVAC and mechanical equipment schedules from construction drawings.\n\nThe input is a drawing sheet that contains one or more equipment schedule tables.\n\nFollow this exact process:\n1. Use layout detection to identify every individual schedule table on the page, including small, tightly packed, or specialty schedules such as LOUVERS, DUCT CONSTRUCTION, ELECTRIC HEATING UNITS, BLOWER COIL UNITS, HEPA FAN FILTER UNITS, INTAKE/RELIEF HOOD SCHEDULE, and AIR TERMINAL UNIT - AIR VALVES. Dense pages may contain 20+ schedules. Every named table must be found and extracted as its own independent object in the schema array.\n2. For each detected table, extract into the schema structure exactly.\n\nSCHEDULE BOUNDARIES (CRITICAL):\nEvery schedule is fully independent. Never merge data from adjacent schedules. Never borrow columns, rows, or header labels from a neighboring table. The title of each object must match the exact table it belongs to — if the title says \"AIR COOLED CHILLER\" it must be its own object even if adjacent to \"AIR HANDLING UNITS\". Never absorb one schedule's rows into a neighboring schedule's table even if they are visually adjacent on the page.\n\nOutput the table field as proper HTML table code only (<table>, <thead>, <tr>, <th>, <tbody>, <td>).\nUse true multi-row headers with colspan and rowspan for hierarchical parent groups. Do not use Markdown tables. Do not use <br/> anywhere in the output.\n\nFirst header row: Broad parent category groups exactly as printed on the drawing. Common groups include but are not limited to: SUPPLY FAN, RETURN FAN, EXHAUST FAN, RELIEF FAN, SUPPLY FAN DATA (PER FAN, 3 FANS PER ARRAY), RELIEF FAN DATA (PER FAN, 3 FANS PER ARRAY), SUPPLY FAN (4 TOTAL - DATA IS FOR EACH FAN), RELIEF FAN (3 TOTAL - DATA IS FOR EACH FAN), COOLING COIL, HEATING COIL, PREHEAT COIL, REHEAT COIL, PRE-FILTER, INTERMEDIATE FILTER, FINAL FILTER, ENTHALPY WHEEL / ENERGY RECOVERY WHEEL, ELECTRICAL, ELECTRICAL DATA, ELECTRICAL MOTOR, MOTOR DATA, CAPACITY DATA, CONNECTION SIZE, CONNECTION SIZE (IN), CABINET DIMENSIONS, APPROX. CABINET DIMENSIONS, INDOOR UNIT ELECTRICAL, OUTDOOR UNIT ELECTRICAL, HEATING CAPACITY, COOLING CAPACITY, FAN MOTOR DATA, WHEEL DATA, ARRAY ELECTRICAL DATA (TOTAL), EVAPORATOR DATA, MAXIMUM ALLOWABLE SOUND POWER, ENCLOSURE, HEATING COIL DATA, COOLING COIL DATA, CFM.\n\nSecond header row: All detailed sub-columns exactly as printed with full units and labels. Common sub-columns include but are not limited to: MARK, AREA SERVED, SUPPLY CFM, MINIMUM OA CFM, FAN CFM, RPM, STATIC PRESSURE TOTAL (TSP), STATIC PRESSURE EXTERNAL (ESP), BHP, HP, VOLTS, PHASE, MCA, MOCP, FLA, TYPE, EAT DB (°F), EAT WB (°F), LAT DB (°F), LAT WB (°F), EWT (°F), LWT (°F), APD (IN WC), WPD (FT HEAD), MBH, SENSIBLE MBH, TOTAL MBH, GPM, DEPTH (IN), MERV, MERV RATING, FACE AREA (SF), VELOCITY (FPM), MEAN APD (IN WC), P.D. IN. W.C. CLEAN/DIRTY, MAX OPERATING WEIGHT, DESIGN BASIS, REMARKS, CFM MAX, CFM MIN, MAX CFM, MIN CFM, NC, MAX NC RAD, MAX NC DIS, ROWS, NO OF ROWS, # OF COILS, OUTLET VEL-FPM, FACE DIMENSIONS, MAX WPD (FT), MAX APD (IN WC), ESP IN H2O, SONES, DRIVE, DAMPER TYPE, SYSTEM SERVED, HEAD (FT), SHUTOFF HEAD (FT), THROAT SIZE (IN), THROAT VELOCITY (FPM), MAXIMUM DIMENSIONS, WEIGHT (LBS), NOMINAL CAPACITY (TONS), NOM. TONS, AMBIENT AIR TEMPERATURE (°F), FULL LOAD (EER), IPLV/DPLV (EER), MAX PD (FT), FOULING FACTOR, REFRIGERANT TYPE, LBS/CIRCUIT, CAPACITY MBH, AVERAGE WATER TEMP (°F), ENCLOSURE LENGTH (FT), ENCLOSURE DEPTH (IN), ENCLOSURE HEIGHT (IN), TANK CAPACITY (GAL), CAP. (GAL), ACCEPTANCE CAPACITY (GAL), RELIEF VALVE (PSI), STRAINER (Y/N), SIZE (IN), BLOW PATTERN, FACTORY FINISH, MATERIAL, DESCRIPTION, MIN AIR TEMP RISE (°F), KW, SEER, NO. OF CIRCUITS, RECOV. (GPH), MIN LOAD MBH/HR, STANDBY LOSS °F/HR, lb/hr, NUMBER OF TUBES, DUCT SIZE W\"xH\", FREE AREA (SF), AIR FLOW PD (IN), DP (IN), W (IN), H (IN), LENGTH, DEPTH, HEIGHT, RECESS, SUCT, DISCH, BHP/HP, EFF %, STATIC PRESS, FAN CONTROL BY, SERVICE/LOCATION, MAX dBA, MODULE SIZE, FAN HP, MOUNTING, COIL TYPE, GAS INPUT MBH, GAS OUTPUT MBH, FAN DIA, FAN RPM, STAT PRESS (ESP IN), VOLTS/PH, FILTER FACE AREA (SF), MT'G HGT AFF, FULL (CFM), EXH CONN SIZE (IN), SUPPLY CONN SIZE (IN), APPROX DIMENSIONS (IN), INLET DIA (IN), RUNOUT SIZE (IN), RNOUT SIZE, DIA (IN), BURNER OPER PRESS (IN WC), NOTES, REQ'D ACCESS.\n\nThe lists above are guidance only and must never override what is actually printed on the drawing.\n\nMULTI-ROW HEADER RULE (CRITICAL — NO EXCEPTIONS):\nAll tables with hierarchical parent group headers MUST use two separate <tr> rows inside <thead> with proper colspan and rowspan attributes.\n\nWRONG — never do this:\n<thead><tr><th>SUPPLY FAN<br/>CFM</th><th>SUPPLY FAN<br/>RPM</th></tr></thead>\n\nCORRECT — always do this:\n<thead>\n  <tr><th colspan=\"2\">SUPPLY FAN</th></tr>\n  <tr><th>CFM</th><th>RPM</th></tr>\n</thead>\n\nSPLIT COLUMN LABEL RULE:\nWhen a column header in a hierarchical table shows two lines of text (e.g. \"MBH\" above \"TOTAL\", or \"EAT °F\" above \"DB\"), these are separate sub-columns — never combine them with <br/>. Create two proper <th> cells in separate header rows with correct colspan and rowspan.\n\nException: In tables with no parent group headers (flat single-row structure), two-line column labels belong in a single <th> as the combined name (e.g. \"CFM MAX\", \"MAX NC RAD\", \"REHEAT COIL MBH\") — do not force a two-row header structure where no parent groups exist in the drawing.\n\nCOMPLETENESS OVERRIDE:\nEven when upstream parsing has been performed, always extract the COMPLETE table directly from the drawing. Never limit extraction to what the parsed output contains. The drawing is always the source of truth — not the parsed intermediate.\n\nNULL RULES (HIGHEST PRIORITY — read before extracting any cell):\n- Use null ONLY for cells that are truly unreadable or physically absent from the drawing.\n- NEVER calculate, infer, interpolate, or derive any value not explicitly printed in the cell.\n- NEVER shift data from one column to an adjacent column.\n- If a value is genuinely zero in the drawing, return 0 — do not replace a real zero with null.\n- Never return \"EMPTY\", empty string, or any placeholder — use null only, and only for truly absent cells.\n- Do not infer values from other rows or similar equipment — every cell must be read independently from the drawing.\n- Pressure range specifications (e.g. \"7-14\") in pressure columns such as BURNER OPER PRESS (IN WC) are legitimate data values — extract exactly as printed in the correct column. Never treat them as note references.\n- Note reference numbers that appear at the end of a data row (e.g. \"1,2,3\") belong in the NOTES or REQ'D ACCESS column ONLY — never in electrical, CFM, GPM, MBH, model number, or any other data cell.\n\nStrict Rules (HIGHEST PRIORITY):\n- Perfect column alignment and correct colspan/rowspan usage on every parent header and vertical spans.\n- Extract every single data row completely without skipping or summarizing.\n- For schedules with mixed equipment subtypes within one table (e.g. CAB UNIT HTRS + UNIT HTRS + AIR CURTAINS), extract ALL rows for ALL subtypes — never stop after the first subtype, never skip rows that look visually different or use a different manufacturer from the rows above.\n- Model numbers must be copied exactly as printed. Never reformat, truncate, abbreviate, or add separators.\n- Tag identifiers must be copied exactly as printed — never substitute visually similar characters. Read carefully: \"3-1\" and \"0-1\" are different tags.\n- SYMBOL and AREA SERVED are always separate columns — never merge into one cell.\n- If a schedule is printed in transposed format (attributes as rows, unit tags as columns), preserve that transposed structure exactly — do not rotate or reformat.\n- Notes and remarks must be copied verbatim in the exact order they are printed. Each numbered note appears exactly once — never duplicated across adjacent tables even if the drawing shares a notes block.\n- Preserve exact text, numbers, units, and design basis from the drawing.\n- Never add extra columns, rows, or data not present in the drawing.\n- Never invent column names — only use column labels physically printed on the drawing.\n\nProcess all tables from top to bottom. Output one schema object per table.\nThis prompt must work on any mechanical schedule sheet regardless of project name, page number, or file name."
+            },
+            {
+              "name": "result_type",
+              "value": "json"
+            },
+            {
+              "name": "structured_output_json_schema",
+              "value": "{\"additionalProperties\": false, \"properties\": {\"mechanical_equipment_schedules\": {\"description\": \"An array of mechanical equipment schedules, each containing a title, notes, and the schedule table itself.\", \"items\": {\"additionalProperties\": false, \"properties\": {\"title\": {\"description\": \"Copy the exact schedule title exactly as printed in the drawing. The title must belong only to the table directly beneath it. Never reuse, shift, or merge a title with an adjacent schedule.\", \"type\": \"string\"}, \"notes\": {\"description\": \"Copy all notes and remarks exactly as written, preserving numbering and print order. Each numbered note must appear exactly once. If no notes exist, return 'None'. Note reference numbers from table rows must not be moved into unrelated data cells.\", \"type\": \"string\"}, \"table\": {\"description\": \"Return the full schedule table as valid HTML only using <table>, <thead>, <tbody>, <tr>, <th>, and <td>. Do not use Markdown tables. Do not use <br/> tags anywhere. Preserve the exact table structure including hierarchical parent headers, sub-headers, colspan, and rowspan exactly as printed. Extract all rows and all cells without skipping. Preserve exact text, units, symbols, model numbers, tags, and formatting exactly as printed. Do not normalize, restructure, calculate, infer, or fabricate values. Use null only when a cell is truly empty in the drawing. If any text, number, or symbol exists in a cell, extract it exactly as printed. Never merge adjacent schedules or mix their titles, notes, headers, or rows.\", \"type\": \"string\"}}, \"required\": [\"title\", \"notes\", \"table\"], \"type\": \"object\"}, \"type\": \"array\"}}, \"required\": [\"mechanical_equipment_schedules\"], \"type\": \"object\"}"
+            },
+            {
+              "name": "merge_continued_tables",
+              "value": "true"
+            },
+            {
+              "name": "page_screenshots",
+              "value": "true"
+            },
+            {
+              "name": "layout_images",
+              "value": "true"
+            },
+            {
+              "name": "preserve_layout_alignment",
+              "value": "true"
+            },
+            {
+              "name": "preserve_very_small_text",
+              "value": "true"
+            },
+            {
+              "name": "max_pages",
+              "value": "20"
+            },
+            {
+              "name": "output_tables_as_markdown",
+              "value": "false"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "8889c7a5-358a-4a3d-9713-7b45e0f87c8d",
+      "name": "Submit Extract Job",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1520,
+        11264
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "zHcdy6Tmcs7XIdS8",
+          "name": "Llama APIHeader"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "amount": 2,
+        "unit": "minutes"
+      },
+      "id": "9c0301bc-df62-4927-98fe-0769e935739c",
+      "name": "Wait Extract 2min",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        1728,
+        11264
+      ],
+      "webhookId": "d92394c1-c71b-44a4-9459-efde77e6e3ad"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Poll Counter — LlamaParse Extract Job\nconst items = $input.all();\nconst item = items[0].json;\nconst pollCount = (item.poll_count || 0) + 1;\nconst maxPolls = 15;\nconst jobId = item.id || item.job_id || $('Submit Extract Job').first().json.id;\n\nif (pollCount > maxPolls) {\n  throw new Error('LlamaParse Extract job timed out after ' + maxPolls + ' polls. Job ID: ' + jobId);\n}\n\nreturn [{\n  json: {\n    ...item,\n    job_id: jobId,\n    poll_count: pollCount,\n    max_polls: maxPolls,\n    poll_exceeded: pollCount > maxPolls\n  }\n}];"
+      },
+      "id": "8fa1b689-0fc9-4443-8ad0-b90a223a6499",
+      "name": "Poll Counter Extract",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1936,
+        11264
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://api.cloud.llamaindex.ai/api/v1/parsing/job/{{ $('Poll Counter Extract').first().json.job_id }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "99b37f3b-2d69-4dc8-a44b-b5258597d3ef",
+      "name": "Check Extract Status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2144,
+        11264
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "zHcdy6Tmcs7XIdS8",
+          "name": "Llama APIHeader"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "68e03f08-a8ae-44d8-8425-90cda5baebbd",
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "SUCCESS",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "75205aee-8512-4206-bde9-cf4cf746cf6d",
+      "name": "Extract Job Complete?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2352,
+        11264
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://api.cloud.llamaindex.ai/api/v1/parsing/job/{{ $('Poll Counter Extract').first().json.job_id }}/result/json",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "80737475-578a-46fa-9c84-6c86e420358f",
+      "name": "Get Extract JSON",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2560,
+        11264
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "zHcdy6Tmcs7XIdS8",
+          "name": "Llama APIHeader"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Prepare LlamaParse Output — Combines Parse result (markdown) and Extract result (JSON)\n// Input (direct): Get Extract JSON output\n// Reference (by name): Get Parse Markdown output\n\nconst extractResult = $input.first().json;  // from Get Extract JSON\nconst parseResult = $('Get Parse Markdown').first().json;  // from Get Parse Markdown\n\nconst fileInfo = $('Extract File Data').first().json;\n\n// Parse markdown text — LlamaParse returns { markdown: \"...\" } from /result/markdown\nconst llamaMarkdown = parseResult?.markdown\n  || parseResult?.text\n  || (typeof parseResult === 'string' ? parseResult : '')\n  || '';\n\n// Extract structured JSON — LlamaParse returns schema output from /result/json\nconst llamaExtract = extractResult || {};\n\nreturn [{\n  json: {\n    source: 'llamaparse',\n    llamaparse_markdown: llamaMarkdown,\n    llamaparse_extract: llamaExtract,\n    file_url: fileInfo.file_url || '',\n    project_name: fileInfo.project_name || 'Unknown Project',\n    drawing_number: fileInfo.drawing_number || 'Unknown'\n  }\n}];"
+      },
+      "id": "6295d05a-e1ff-40f9-94a5-6f7abfeb22fa",
+      "name": "Prepare LlamaParse Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2768,
+        11264
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "append"
+      },
+      "id": "bdc8514f-1536-4956-b8b1-20a95f498a45",
+      "name": "Merge Results",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [
+        2768,
+        11216
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// PRE-FLIGHT CHECK\nconst fileInfo = $('Extract File Data').first().json;\n\n// ── SOURCE A: LlamaParse ──\nconst llamaRaw = $('Prepare LlamaParse Output').first().json;\nconst llamaMarkdown = llamaRaw?.llamaparse_markdown || '';\nconst llamaTableCount = (llamaMarkdown.match(/###\\s+[A-Z]/g) || []).length;\n\n// ── SOURCE B: Claude Direct Extract (AI Agent output) ──\nconst claudeRaw = $('Claude Direct Extract').first().json;\n\nlet claudeText = '';\nconst isAgentOutput = !!claudeRaw?.output;\nif (isAgentOutput) {\n  claudeText = claudeRaw.output;\n} else if (claudeRaw?.content && Array.isArray(claudeRaw.content)) {\n  claudeText = claudeRaw.content.map(b => b.text || '').join('');\n} else {\n  claudeText = '';\n}\n\n// Detect API-level truncation (HTTP Request path — stop_reason)\nconst apiTruncated = claudeRaw?.stop_reason === 'max_tokens';\n\n// Parse Claude output — strip markdown fences if present\nconst cleanText = claudeText.replace(/^```json\\s*/i, '').replace(/```\\s*$/, '').trim();\nlet claudeParsed = null;\nlet parseError = null;\ntry {\n  claudeParsed = JSON.parse(cleanText);\n} catch (e) {\n  parseError = e.message;\n}\n\nconst announcedMatch = claudeText.match(/Detected\\s+(\\d+)\\s+schedule/i);\nconst announcedCount = announcedMatch ? parseInt(announcedMatch[1]) : null;\nconst extractedCount = claudeParsed?.mechanical_equipment_schedules?.length || 0;\nconst declaredIncomplete = claudeParsed?.incomplete === true;\nconst remainingSchedules = claudeParsed?.remaining_schedules || [];\n\n// ── BUILD ERRORS ──\nconst errors = [];\n\nif (!llamaMarkdown || llamaMarkdown.trim().length === 0) {\n  errors.push('SOURCE_A EMPTY: LlamaParse returned no markdown content.');\n}\n\nif (!claudeText || claudeText.trim().length === 0) {\n  errors.push('SOURCE_B EMPTY: Claude Direct Extract returned no output.');\n}\n\nif (parseError) {\n  errors.push('SOURCE_B PARSE FAILED: Claude output is not valid JSON. Error: ' + parseError);\n}\n\nif (apiTruncated) {\n  errors.push(\n    'SOURCE_B TRUNCATED BY API: Claude Direct Extract hit max_tokens limit (stop_reason=max_tokens). ' +\n    'Extracted ' + extractedCount + ' schedules before cutoff. ' +\n    'Fix: verify Anthropic Chat Model maxTokensToSample is set to 32000.'\n  );\n}\n\nif (declaredIncomplete) {\n  errors.push(\n    'SOURCE_B INCOMPLETE: Claude declared incomplete=true. ' +\n    'Extracted ' + extractedCount + ' schedules, remaining: [' + remainingSchedules.join(', ') + '].'\n  );\n}\n\nif (announcedCount !== null && extractedCount < announcedCount) {\n  errors.push(\n    'SOURCE_B SCHEDULE GAP: Claude announced ' + announcedCount + ' schedules but only ' +\n    extractedCount + ' extracted. Missing ' + (announcedCount - extractedCount) + ' schedule(s).'\n  );\n}\n\nconst flags = {\n  source_a_has_content: llamaMarkdown.length > 0,\n  source_a_table_count_approx: llamaTableCount,\n  source_b_output_format: isAgentOutput ? 'ai_agent' : 'http_request',\n  source_b_api_truncated: apiTruncated,\n  source_b_parse_error: parseError,\n  source_b_declared_incomplete: declaredIncomplete,\n  source_b_announced_count: announcedCount,\n  source_b_extracted_count: extractedCount,\n  source_b_remaining: remainingSchedules,\n  preflight_passed: errors.length === 0,\n  preflight_errors: errors\n};\n\nreturn [{\n  json: {\n    preflight_status: errors.length === 0 ? 'PASS' : 'FAIL',\n    flags,\n    source_a: llamaRaw,\n    source_b_parsed: claudeParsed,\n    source_b_text: claudeText,\n    file_info: fileInfo,\n    error_summary: errors.length > 0 ? errors.join(' | ') : null\n  }\n}];"
+      },
+      "id": "1e151e89-cd78-4240-a1a6-ff4e71107071",
+      "name": "Pre-Flight Check",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2976,
+        11216
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "54cef7cd-45e2-49b6-972e-1961f7142d32",
+              "leftValue": "={{ $json.preflight_status }}",
+              "rightValue": "PASS",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "b6f254ce-7c6e-41c5-a80b-35cdf1cae6be",
+      "name": "IF Preflight Pass?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        3184,
+        11216
+      ]
+    },
+    {
+      "parameters": {
+        "errorMessage": "={{ 'PREFLIGHT FAILED: ' + ($json.error_summary || 'Unknown preflight error') }}"
+      },
+      "id": "69447915-af1d-4863-9e67-09db6eb48da0",
+      "name": "Stop and Error",
+      "type": "n8n-nodes-base.stopAndError",
+      "typeVersion": 1,
+      "position": [
+        3392,
+        11376
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Prepare Agent Input — Fixed\n// Reads SOURCE_A and SOURCE_B from Pre-Flight Check output\n// PDF binary from Webhook Trigger — AI Agent passthroughBinaryImages handles conversion\n\nconst preflight = $input.first().json;\nconst fileInfo = preflight.file_info;\nconst llamaData = preflight.source_a;\nconst claudeParsed = preflight.source_b_parsed;\n\n// SOURCE_A: LlamaParse markdown (compact — no bBox noise)\nconst sourceAText = llamaData?.llamaparse_markdown || 'SOURCE A NOT AVAILABLE';\n\n// SOURCE_B: Claude structured JSON\nconst sourceBText = claudeParsed\n  ? JSON.stringify(claudeParsed, null, 2)\n  : 'SOURCE B NOT AVAILABLE';\n\nconst chatInput =\n  'SOURCE_A (LlamaParse Extract — markdown format):\\n' + sourceAText + '\\n\\n' +\n  'SOURCE_B (Claude Extract — structured JSON):\\n' + sourceBText + '\\n\\n' +\n  'SOURCE_OF_TRUTH: The PDF document attached to this message is the original drawing. ' +\n  'The PDF is always correct — both extractions are approximations of what is in the PDF.\\n\\n' +\n  'File: ' + (fileInfo.file_name || 'drawing.pdf') + '\\n' +\n  'Project: ' + (fileInfo.project_name || 'Unknown') + '\\n' +\n  'Drawing: ' + (fileInfo.drawing_number || 'Unknown') + '\\n\\n' +\n  'CRITICAL: Do NOT output ANY text. Call submit_extraction_result IMMEDIATELY as your first and only output.\\n\\n' +\n  'Call submit_extraction_result with: incomplete (boolean), remaining_schedules (array of strings), ' +\n  'and mechanical_equipment_schedules (array with schedule_title, notes, header_groups, columns, rows). ' +\n  'Do NOT pass extraction_summary, confidence, source, accuracy, or conflicts to the tool.';\n\n// PDF binary from Webhook Trigger — passthroughBinaryImages on AI Agent handles conversion\nconst webhookBinary = $('Webhook Trigger').first().binary || {};\n\nreturn [{\n  json: {\n    chatInput,\n    sourceA: sourceAText !== 'SOURCE A NOT AVAILABLE' ? 'present' : 'missing',\n    sourceB: sourceBText !== 'SOURCE B NOT AVAILABLE' ? 'present' : 'missing',\n    fileName: fileInfo.file_name || 'drawing.pdf',\n    preflight_flags: preflight.flags\n  },\n  binary: webhookBinary\n}];"
+      },
+      "id": "5cc18e32-cb32-43aa-9acb-4dd338909a33",
+      "name": "Prepare Agent Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3392,
+        11056
+      ]
+    },
+    {
+      "parameters": {
+        "options": {
+          "systemMessage": "\n\nYou are the PhaseAlpha Comparison Agent. Your job is to compare two independent extractions of the same mechanical equipment schedule drawing — and validate both against a source of truth — then produce a single merged output that is more accurate than either source alone.\n\nCRITICAL OUTPUT RULE: Do NOT output ANY text. No analysis, no step logs, no explanations. Perform all 8 steps silently and call the submit_extraction_result tool IMMEDIATELY as your first and only output. Every token must go toward the tool payload.\n\nYou will receive three inputs:\n- SOURCE_A: LlamaParse Extract output (title/notes/table as HTML string)\n- SOURCE_B: Claude Extract output (schedule_title/notes/header_groups/columns/rows as named fields)\n- SOURCE_OF_TRUTH: The parsed markdown or PDF of the same drawing — the confirmed baseline\n\nOUTPUT: Return ONLY valid JSON — no explanation, no markdown, no HTML:\n\n{\n  \"extraction_summary\": {\n    \"source_a_schedules\": 0,\n    \"source_b_schedules\": 0,\n    \"matched_schedules\": 0,\n    \"source_a_only\": [],\n    \"source_b_only\": [],\n    \"flagged_for_review\": [],\n    \"accuracy_summary\": {\n      \"source_a\": \"overall %\",\n      \"source_b\": \"overall %\",\n      \"merged\": \"overall %\",\n      \"schedules_fully_correct\": 0,\n      \"schedules_with_conflicts\": 0,\n      \"schedules_requiring_human_review\": 0\n    }\n  },\n  \"mechanical_equipment_schedules\": [\n    {\n      \"schedule_title\": \"exact title\",\n      \"confidence\": \"high | medium | low\",\n      \"source\": \"both | source_a | source_b\",\n      \"accuracy\": {\n        \"source_a\": \"X/Y cells correct\",\n        \"source_b\": \"X/Y cells correct\",\n        \"merged\": \"X/Y cells correct\"\n      },\n      \"conflicts\": [],\n      \"tag_anomaly_note\": \"only if present — omit field entirely otherwise\",\n      \"known_limitation\": \"only if a known failure applies — omit field entirely otherwise\",\n      \"notes\": [],\n      \"columns\": [],\n      \"rows\": []\n    }\n  ]\n}\n\nSTEP 1 — MATCH SCHEDULES ACROSS BOTH SOURCES:\nMatch Source A and Source B schedule objects by title. Normalize for case and spacing.\nFor each matched pair proceed to Step 2.\nFor schedules in Source A only: include with source: \"source_a\", confidence: \"medium\".\nFor schedules in Source B only: include with source: \"source_b\", confidence: \"medium\".\n\nSTEP 2 — COMPARE ROW COUNTS:\nParse Source A HTML tbody row count. Get Source B rows array length.\nIf counts match: proceed to Step 3.\nIf Source A has more rows: use Source A as authoritative. Flag in conflicts.\nIf Source B has more rows: use Source B as authoritative. Flag in conflicts.\n\nSTEP 3 — ESTABLISH COLUMN STRUCTURE:\nUse Source B columns array and header_groups as the base column structure.\nIf Source A HTML contains colspan parent group headers not in Source B header_groups: add them.\nIf Source B has invented column names not matching any printed label: flag and default to Source A.\nThe merged columns array is the final authoritative column list.\n\nSTEP 4 — MERGE ROW DATA:\nCompare values cell by cell using the merged column structure.\n\nFor every cell where Source A and Source B have different non-null values, apply this sequence in strict order. Do not skip to arbitration rules if the source of truth resolves it.\n\n  4a. SOURCE OF TRUTH FIRST (always check this before any arbitration rule):\n      Look up this cell's value in SOURCE_OF_TRUTH.\n      If SOURCE_OF_TRUTH has a clearly readable value for this cell — use it. Record: \"Resolved via source of truth: [value].\" No further arbitration needed for this cell.\n      If SOURCE_OF_TRUTH is not clearly readable for this cell — proceed to 4b.\n\n  4b. ARBITRATION RULES (only when source of truth cannot resolve):\n\n    TAG COLUMN:\n      Source A has alphanumeric tag, Source B has ILLEGIBLE or numeric value — use Source A.\n      Source B has alphanumeric tag, Source A has numeric or garbled value — use Source B.\n      Both have different recognizable tags — check SERVICE column. If the SERVICE value unambiguously identifies the correct tag, use the source whose tag matches that service. Record: \"TAG resolved via SERVICE column cross-reference.\" If SERVICE does not resolve it, flag for human review and record both values.\n\n    MODEL NUMBERS:\n      Prefer the longer more complete value.\n      TRAILING CHARACTER DUPLICATION: If one source has a model number ending in a repeated final character (e.g. XX, DD) while the other source has a single character, the doubled version is a likely OCR duplication artifact. Prefer the single-character version and add to conflicts: \"Model trailing character duplication suspected — prefer [single-X version] — route to Layer 6b for verification.\"\n      If character substitution suspected (O vs 0, B vs 8): flag for human review. Record both. Route to Layer 6b.\n\n    NUMERIC DATA (CFM, GPM, MBH, HP, etc.):\n      Differ by less than 1% — use Source A, note minor variance.\n      Differ significantly — go back to step 4a and re-check source of truth. If still unresolved, flag for human review. Record both.\n\n    DIMENSION COLUMNS (W, H, LENGTH, DEPTH, HEIGHT, RECESS):\n      If one source shows a value that appears implausibly large for the equipment type, do not auto-accept it. Go back to step 4a and re-check source of truth for this cell specifically.\n\n    PRESSURE RANGE VALUES (e.g. \"7-14\"):\n      Legitimate BURNER OPER PRESS (IN WC) specification — never a conflict.\n      Use whichever source placed it in the correct pressure column.\n\n    Both sources have ILLEGIBLE: return \"ILLEGIBLE\". Cell confidence: low.\n\nFor cells where one source has a value and the other has null or ILLEGIBLE:\n  Source B has value, Source A has null or ILLEGIBLE — use Source B value. No conflict.\n  Source A has value, Source B has ILLEGIBLE — use Source A value. Record: \"Source A provided [X] for [COLUMN] — Source B marked ILLEGIBLE.\"\n  Source A has value, Source B has null — use Source A value if column alignment is confirmed correct.\n\nSTEP 5 — SOURCE OF TRUTH SCORING:\nAfter merging all cells, compute accuracy scores by comparing each merged value against SOURCE_OF_TRUTH.\n\nExact match — confirmed: true.\nMismatch — add to conflicts: \"Merged value [X] does not match source of truth [Y] — Source A had [A_val], Source B had [B_val]\". Use source of truth value. Reduce confidence to low if TAG or MODEL is wrong.\nBoth sources wrong — flag for human review. Use source of truth value. Note: \"Neither source matched source of truth for this cell.\"\nSource of truth missing a value — keep merged value. Do not penalize.\n\nCompute per schedule: source_a cells correct / total, source_b cells correct / total, merged cells correct / total.\n\nSTEP 6 — KNOWN FAILURE HANDLING:\n\nBOILER BURNER OPERATING PRESSURE:\n\"7-14\" in BURNER OPER PRESS (IN WC) or OPER GAS PRESS (INWC) is legitimate data. Never flag as conflict.\n\nHYDRONIC HEATING UNITS — 6 ROWS:\nBoth sources return 6 rows (CUH1–CUH5, UH1). Do not flag as incomplete.\nAdd: \"known_limitation\": \"BERNER and STERLING RW rows not visible at source drawing resolution — route to Layer 6b.\"\n\nATU-3 TAG PREFIX:\nTags beginning with \"0-\" are a confirmed font rendering artifact. Extract exactly as printed.\nPreserve tag_anomaly_note from Source B. Add to Layer 6b routing: \"0-N tags require prefix correction to 3-N.\"\n\nPUMP TAG COLUMN:\nIf both sources return different recognizable tags for the same pump row, apply SERVICE column cross-reference first (Step 4b TAG COLUMN rule). Only return ILLEGIBLE if SERVICE column also fails to resolve the conflict.\nAdd: \"known_limitation\": \"Pump TAG column at drawing left margin — route to Layer 6b for model-based tag assignment if still unresolved.\"\n\nSTEP 7 — ASSIGN CONFIDENCE:\n\nhigh: Both sources found schedule. Row counts match. No unresolved conflicts. No ILLEGIBLE in TAG column.\nmedium: Row counts differ OR minor conflicts resolved by arbitration OR some ILLEGIBLE in non-critical columns.\nlow: Only one source found schedule OR TAG column has ILLEGIBLE OR unresolved conflicts OR significant row count difference.\n\nAdd all low-confidence schedules to extraction_summary.flagged_for_review.\n\nSTEP 8 — BUILD FINAL OUTPUT:\nFor each merged schedule output: schedule_title, confidence, source, accuracy, conflicts (empty array if none), tag_anomaly_note (omit if not applicable), known_limitation (omit if not applicable), notes (deduplicated in print order), columns (merged list from Step 3), rows (merged data from Steps 4 and 5).\n\nBuild extraction_summary with all counts and accuracy_summary percentages.\n\nCRITICAL RULES:\nNever invent data. If neither source has a value and source of truth is unreadable, return null.\nNever merge two different equipment rows into one.\nNever skip a row because it appears in only one source.\nNever change a tag value during merging — tag corrections happen in Layer 6b not here.\nNever add columns that appear in neither source.\nPreserve exact text, numbers, units, and model numbers from the source that provided the value.\nSOURCE OF TRUTH always takes precedence over arbitration rules when readable.\nProcess all schedules in top-to-bottom page order.\nOutput one merged object per schedule.\nThis agent must work on any mechanical schedule drawing regardless of engineering firm, project name, or drawing complexity.\n\nFINAL OUTPUT INSTRUCTION: After completing the 8-step comparison, you MUST call the submit_extraction_result tool with the final merged result. The tool expects three fields: incomplete (boolean), remaining_schedules (array of strings), and mechanical_equipment_schedules (array of schedule objects each containing schedule_title, tag_anomaly_note (only if applicable), notes, header_groups, columns, and rows). Do NOT pass extraction_summary, confidence, source, accuracy, or conflicts to the tool — those are your internal working data. The tool output must contain ONLY the clean merged schedule data in PhaseAlpha output format. CRITICAL: Do NOT output ANY text before calling the tool. No step explanations, no conflict logs, no analysis. Perform all comparison work silently and call the tool IMMEDIATELY as your first and only output. Every token must go toward the tool payload.",
+          "maxIterations": 20,
+          "passthroughBinaryImages": true
+        }
+      },
+      "id": "9ab2b62c-12bb-4c81-940c-2e559e9ebd95",
+      "name": "AI Agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3,
+      "position": [
+        3600,
+        11056
+      ]
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "claude-sonnet-4-6",
+          "mode": "list",
+          "cachedResultName": "Claude Sonnet 4.6"
+        },
+        "options": {
+          "maxTokensToSample": 32000,
+          "thinking": true
+        }
+      },
+      "id": "f8f72d28-1f03-4904-9f29-12ef48635929",
+      "name": "Anthropic Chat Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.3,
+      "position": [
+        3600,
+        11248
+      ],
+      "credentials": {
+        "anthropicApi": {
+          "id": "je1vli3fFL5A38FY",
+          "name": "PhaseAlpha Claude API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "name": "submit_extraction_result",
+        "description": "Submit the final merged mechanical equipment schedule extraction. Call this tool exactly once with the complete result after comparing Source A, Source B, and the source of truth PDF.",
+        "jsCode": "const result = query;\n\nif (typeof result.incomplete !== 'boolean') {\n  throw new Error('incomplete must be boolean');\n}\nif (!Array.isArray(result.remaining_schedules)) {\n  throw new Error('remaining_schedules must be array');\n}\nif (!Array.isArray(result.mechanical_equipment_schedules)) {\n  throw new Error('mechanical_equipment_schedules must be array');\n}\n\nfor (const schedule of result.mechanical_equipment_schedules) {\n  if (!schedule.schedule_title) {\n    throw new Error('Each schedule needs schedule_title');\n  }\n  if (!Array.isArray(schedule.notes)) {\n    throw new Error(schedule.schedule_title + ' — notes must be array');\n  }\n  if (!Array.isArray(schedule.header_groups)) {\n    throw new Error(schedule.schedule_title + ' — header_groups must be array');\n  }\n  if (!Array.isArray(schedule.columns)) {\n    throw new Error(schedule.schedule_title + ' — columns must be array');\n  }\n  if (!Array.isArray(schedule.rows)) {\n    throw new Error(schedule.schedule_title + ' — rows must be array');\n  }\n}\n\nreturn [{ json: result }];",
+        "specifyInputSchema": true,
+        "schemaType": "manual",
+        "inputSchema": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"incomplete\": {\n      \"type\": \"boolean\",\n      \"description\": \"false when all schedules are complete. true only if output size limits prevented finishing.\"\n    },\n    \"remaining_schedules\": {\n      \"type\": \"array\",\n      \"items\": { \"type\": \"string\" },\n      \"description\": \"Schedule titles not yet output. Empty array when incomplete is false.\"\n    },\n    \"mechanical_equipment_schedules\": {\n      \"type\": \"array\",\n      \"description\": \"One object per schedule table in top-to-bottom page order.\",\n      \"items\": {\n        \"type\": \"object\",\n        \"properties\": {\n          \"schedule_title\": { \"type\": \"string\", \"description\": \"Exact title as printed on drawing.\" },\n          \"tag_anomaly_note\": { \"type\": \"string\", \"description\": \"Include ONLY when tag anomaly detected. Omit entirely otherwise.\" },\n          \"notes\": { \"type\": \"array\", \"items\": { \"type\": \"string\" }, \"description\": \"All notes exactly as printed, in order. Empty array if none.\" },\n          \"header_groups\": {\n            \"type\": \"array\",\n            \"items\": {\n              \"type\": \"object\",\n              \"properties\": {\n                \"label\": { \"type\": [\"string\", \"null\"], \"description\": \"Parent group name or null if no parent.\" },\n                \"columns\": { \"type\": \"array\", \"items\": { \"type\": \"string\" } }\n              }\n            }\n          },\n          \"columns\": { \"type\": \"array\", \"items\": { \"type\": \"string\" } },\n          \"rows\": { \"type\": \"array\", \"items\": { \"type\": \"object\" } }\n        },\n        \"required\": [\"schedule_title\", \"notes\", \"header_groups\", \"columns\", \"rows\"]\n      }\n    }\n  },\n  \"required\": [\"incomplete\", \"remaining_schedules\", \"mechanical_equipment_schedules\"]\n}"
+      },
+      "id": "d819c759-d941-4f3c-9187-15cc4d2a3687",
+      "name": "submit_extraction_result",
+      "type": "@n8n/n8n-nodes-langchain.toolCode",
+      "typeVersion": 1.1,
+      "position": [
+        3744,
+        11296
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "options": {}
+      },
+      "id": "da55f551-0503-450d-ae64-1773ef550be1",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        3904,
+        11056
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { error: true, message: $json.execution?.error?.message || 'Pipeline failed', node: $json.execution?.error?.node || 'unknown' } }}",
+        "options": {
+          "responseCode": 500
+        }
+      },
+      "id": "c9eac58f-06cd-4503-a771-dda41dadbf35",
+      "name": "Error Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1136,
+        11568
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Prepare Claude Direct Extract — HTTP Request to /v1/messages\n// Sends PDF as base64 document content block for native PDF understanding\nconst fileData = $('Extract File Data').first().json;\nconst base64Data = fileData.base64_data;\nconst mimeType = fileData.mime_type || 'application/pdf';\n\nif (!base64Data) {\n  throw new Error('No PDF binary data available. Ensure webhook sends PDF as multipart/form-data with field name \"data\" or \"file\".');\n}\n\nconst systemPrompt = \"You are an expert at reading and extracting complex HVAC and mechanical equipment schedules from construction drawing images.\\n\\nThe input is a high-resolution image or PDF of a mechanical schedule page from a construction drawing set. The page contains multiple equipment schedule tables.\\n\\nOUTPUT: Return ONLY valid JSON in this exact structure — no explanation, no markdown, no HTML:\\n\\n{\\n  \\\"incomplete\\\": false,\\n  \\\"remaining_schedules\\\": [],\\n  \\\"mechanical_equipment_schedules\\\": [\\n    {\\n      \\\"schedule_title\\\": \\\"exact title as printed on the drawing\\\",\\n      \\\"tag_anomaly_note\\\": \\\"only include if tag anomaly detected — omit field entirely otherwise\\\",\\n      \\\"notes\\\": [\\\"note 1 exactly as printed\\\", \\\"note 2 exactly as printed\\\"],\\n      \\\"header_groups\\\": [\\n        {\\n          \\\"label\\\": \\\"PARENT GROUP NAME or null if no parent group\\\",\\n          \\\"columns\\\": [\\\"SUB-COLUMN 1\\\", \\\"SUB-COLUMN 2\\\"]\\n        }\\n      ],\\n      \\\"columns\\\": [\\\"flat ordered list of all column names left to right — prefix sub-columns with parent group name when the same sub-column name appears under multiple parent groups, e.g. SUPPLY FAN DESIGN CFM\\\"],\\n      \\\"rows\\\": [\\n        {\\n          \\\"COLUMN NAME 1\\\": \\\"value\\\",\\n          \\\"COLUMN NAME 2\\\": \\\"value\\\"\\n        }\\n      ]\\n    }\\n  ]\\n}\\n\\nCELL VALUE RULES — THREE STATES ONLY:\\nEvery cell must be one of exactly three states:\\n- A value: the exact text, number, or symbol printed in the cell — copied verbatim\\n- null: the cell is physically absent or completely blank — no text, no symbol, nothing printed\\n- \\\"ILLEGIBLE\\\": text or a value is visibly present but cannot be read due to image resolution, print quality, or scale\\n\\nIf you can partially read a value, extract what is legible and append \\\"?\\\" to signal uncertainty — e.g. \\\"GS-300-?\\\" — rather than marking the whole cell ILLEGIBLE.\\nNever guess, infer, approximate, or derive a value.\\n\\nTAG COLUMN RULES (CRITICAL — TAG IS THE PRIMARY JOIN KEY):\\n- TAG is the most important field in every row. Downstream systems use it as the primary identifier. A wrong TAG corrupts all downstream joins.\\n- If a TAG cell cannot be read with high confidence, always return \\\"ILLEGIBLE\\\" — never null. A null TAG means the row does not exist. An ILLEGIBLE TAG means the row exists but needs human resolution. This distinction is critical for routing.\\n- TAG values are always alphanumeric identifiers such as AHU-1, CUH1, CP-3, EF-9, VAV-2-14. They are never HP values, wattage fractions, or decimals.\\n- If the leftmost column of a table appears to contain numeric-only values such as \\\"0.4\\\", \\\"1/15\\\", or \\\"1/3\\\", those are NOT TAG values — they are data from an adjacent column (commonly HP or WATTS) that has shifted. Re-examine the full row structure, identify the correct TAG column, and extract accordingly. If the TAG column cannot be resolved with confidence, mark those cells ILLEGIBLE.\\n\\nTAG ANOMALY FLAGGING:\\nIf tags in a schedule follow a clear sequential pattern (e.g. \\\"1-1\\\", \\\"1-2\\\" for AHU-1 terminals; \\\"2-1\\\", \\\"2-2\\\" for AHU-2 terminals) and the AHU-3 schedule produces tags beginning with \\\"0-\\\" (e.g. \\\"0-1\\\", \\\"0-2\\\"), do not modify the tag value — extract exactly as printed. Instead add a \\\"tag_anomaly_note\\\" field to that schedule object: \\\"0- prefix on AHU-3 tags may be a font rendering artifact — verify against drawing.\\\" Omit this field entirely from all other schedules.\\n\\nSECTION DIVIDER ROWS:\\nSome tables contain bold or visually distinct rows that are equipment subtype headers rather than data rows — for example \\\"CAB UNIT HTRS\\\", \\\"UNIT HTRS\\\", \\\"AIR CURTAINS\\\", \\\"FAN COIL UNITS\\\". These section dividers separate visual sub-groups within a single table. Do not extract them as data rows. Extract only rows that contain a valid TAG identifier or alphanumeric equipment identifier in the first data column. This applies to any table type, not just Hydronic schedules.\\n\\nOUTPUT COMPLETENESS:\\nDetect and count all schedule tables on the drawing before outputting anything.\\nOutput all schedule objects sequentially in one continuous response — never pause, never wait for user input, never stop until incomplete is false.\\nIf output size prevents completing all schedules, output as many complete schedule objects as possible in order of appearance, then set \\\"incomplete\\\": true and list the titles of unoutput schedules in \\\"remaining_schedules\\\". Never truncate a schedule mid-object — each object must be complete or not included at all. On the next user message, immediately continue from where extraction stopped — no preamble, just continue the JSON array.\\n\\nSCHEDULE DETECTION (CRITICAL):\\nIdentify every individual schedule table on the page — including small, tightly packed, or specialty schedules such as LOUVERS, DUCT CONSTRUCTION, ELECTRIC HEATING UNITS, BLOWER COIL UNITS, HEPA FAN FILTER UNITS, INTAKE/RELIEF HOOD SCHEDULE, and AIR TERMINAL UNIT - AIR VALVES. Dense pages may contain 20+ schedules. Every named table must be its own independent object in the array.\\n\\nSCHEDULE BOUNDARIES (CRITICAL):\\nEvery schedule is fully independent. Never merge data from adjacent schedules. Never borrow columns, rows, or header labels from a neighboring table. The schedule_title must belong only to the table directly beneath it. Never absorb one schedule's rows into a neighboring schedule's object.\\n\\nHEADER GROUPS:\\nFor every schedule, identify the parent group structure exactly as printed on the drawing:\\n- If a table has broad parent categories spanning multiple sub-columns (e.g. COOLING COIL spanning EWT °F, LWT °F, GPM), capture each parent as a header_group with its label and sub-columns listed.\\n- If columns have no parent group, set label to null and list those columns directly.\\n- The columns array must be the flat ordered list of ALL sub-column names left to right.\\n\\nNULL RULES (HIGHEST PRIORITY — apply before writing any value):\\n- Use null ONLY when a cell is physically absent or completely blank — no text, no symbol, nothing printed\\n- Use \\\"ILLEGIBLE\\\" when something is visibly printed but cannot be read at current resolution\\n- NEVER calculate, infer, interpolate, or derive any value not explicitly printed in the cell\\n- NEVER shift data from one column to an adjacent column\\n- If a value is clearly 0 in the drawing, return 0 — do not replace a genuine zero with null\\n- Pressure range specifications (e.g. \\\"7-14\\\") in pressure columns such as BURNER OPER PRESS (IN WC) are legitimate data values — extract exactly as printed in the correct column\\n- Note reference numbers (e.g. \\\"1,2,3\\\") belong in the NOTES or REQ'D ACCESS column ONLY — never in electrical, CFM, GPM, MBH, or model number cells\\n\\nSTRICT EXTRACTION RULES (HIGHEST PRIORITY):\\n- Extract every single data row completely without skipping or summarizing\\n- For schedules with mixed equipment subtypes within one table, extract ALL rows for ALL subtypes\\n- Model numbers must be copied exactly as printed — never reformat, truncate, abbreviate, or add separators\\n- Tag identifiers must be copied exactly as printed — never substitute visually similar characters\\n- SYMBOL and AREA SERVED are always separate columns — never merge into one field\\n- Notes must be copied verbatim in the exact order printed. Each numbered note appears exactly once\\n- Never add extra columns, rows, or data not present in the drawing\\n- Never invent column names — only use column labels physically printed on the drawing\\n\\nSECOND PASS VERIFICATION:\\nBefore returning the JSON, verify:\\n- Every schedule on the page has its own object in the array — no schedule was missed\\n- No schedule's rows were absorbed into an adjacent schedule\\n- All note references are in NOTES or REQ'D ACCESS only\\n- All model numbers and tags are exact copies — no substitutions\\n- Every visible data row was extracted — no rows were skipped\\n- Any cells with visible but unreadable content are marked ILLEGIBLE not null\\n- No section divider rows were included as data rows\\n- TAG columns contain only alphanumeric equipment identifiers — not HP, wattage, or numeric-only values\\n\\nProcess all tables from top to bottom. Output one object per table.\\nThis prompt must work on any mechanical schedule sheet regardless of project name, page number, engineering firm, or drawing layout.\\n\\nApply PhaseAlpha_AutoBatch_Output, PhaseAlpha_SecondPass_Verification, and PhaseAlpha_ILLEGIBLE_Decision on every extraction without exception.\";\n\nconst requestBody = {\n  model: \"claude-sonnet-4-6\",\n  max_tokens: 32000,\n  system: systemPrompt,\n  messages: [{\n    role: \"user\",\n    content: [\n      {\n        type: \"document\",\n        source: {\n          type: \"base64\",\n          media_type: mimeType,\n          data: base64Data\n        }\n      },\n      {\n        type: \"text\",\n        text: \"Extract all mechanical equipment schedules from this construction drawing PDF. Return ONLY valid JSON matching the PhaseAlpha output schema. Process every schedule table on every page.\"\n      }\n    ]\n  }]\n};\n\nreturn [{\n  json: {\n    request_body: requestBody,\n    file_name: fileData.file_name || 'drawing.pdf',\n    project_name: fileData.project_name || 'Unknown Project',\n    drawing_number: fileData.drawing_number || 'Unknown'\n  }\n}];"
+      },
+      "id": "6386f18b-be3e-45da-994b-8d1c43a1865c",
+      "name": "Prepare Claude HTTP Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        80,
+        10736
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "anthropicApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "content-type",
+              "value": "application/json"
+            },
+            {
+              "name": "anthropic-beta",
+              "value": "pdfs-2024-09-25"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.request_body) }}",
+        "options": {
+          "timeout": 600000
+        }
+      },
+      "id": "43705b08-dc4a-4909-9f0d-c0ddeb6e749f",
+      "name": "Claude Direct Extract",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        272,
+        10736
+      ],
+      "credentials": {
+        "anthropicApi": {
+          "id": "je1vli3fFL5A38FY",
+          "name": "PhaseAlpha Claude API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Restore PDF binary for Submit Extract Job\n// Binary data is lost after polling loop (Code/HTTP nodes don't preserve input binary)\n// Re-attach binary from Prepare LlamaParse Upload so Submit Extract Job can upload the PDF\nconst parseMarkdownResult = $input.first().json;\nconst binary = $('Prepare LlamaParse Upload').first().binary || {};\n\nreturn [{\n  json: parseMarkdownResult,\n  binary: binary\n}];"
+      },
+      "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "name": "Restore Binary for Extract",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1208,
+        11264
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Comparison Agent": {
+      "main": [
+        []
+      ]
+    },
+    "Prepare Comparison Input": {
+      "main": [
+        []
+      ]
+    },
+    "Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "Extract File Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract File Data": {
+      "main": [
+        [
+          {
+            "node": "Prepare Claude HTTP Request",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Prepare LlamaParse Upload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare LlamaParse Upload": {
+      "main": [
+        [
+          {
+            "node": "Submit Parse Job",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Submit Parse Job": {
+      "main": [
+        [
+          {
+            "node": "Wait Parse 2min",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait Parse 2min": {
+      "main": [
+        [
+          {
+            "node": "Poll Counter Parse",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Poll Counter Parse": {
+      "main": [
+        [
+          {
+            "node": "Check Parse Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Parse Status": {
+      "main": [
+        [
+          {
+            "node": "Parse Job Complete?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Job Complete?": {
+      "main": [
+        [
+          {
+            "node": "Get Parse Markdown",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Wait Parse 2min",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Parse Markdown": {
+      "main": [
+        [
+          {
+            "node": "Restore Binary for Extract",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Submit Extract Job": {
+      "main": [
+        [
+          {
+            "node": "Wait Extract 2min",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait Extract 2min": {
+      "main": [
+        [
+          {
+            "node": "Poll Counter Extract",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Poll Counter Extract": {
+      "main": [
+        [
+          {
+            "node": "Check Extract Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Extract Status": {
+      "main": [
+        [
+          {
+            "node": "Extract Job Complete?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Job Complete?": {
+      "main": [
+        [
+          {
+            "node": "Get Extract JSON",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Wait Extract 2min",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Extract JSON": {
+      "main": [
+        [
+          {
+            "node": "Prepare LlamaParse Output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare LlamaParse Output": {
+      "main": [
+        [
+          {
+            "node": "Merge Results",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge Results": {
+      "main": [
+        [
+          {
+            "node": "Pre-Flight Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pre-Flight Check": {
+      "main": [
+        [
+          {
+            "node": "IF Preflight Pass?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF Preflight Pass?": {
+      "main": [
+        [
+          {
+            "node": "Prepare Agent Input",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Stop and Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Agent Input": {
+      "main": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anthropic Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "submit_extraction_result": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude Direct Extract": {
+      "main": [
+        [
+          {
+            "node": "Merge Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Claude HTTP Request": {
+      "main": [
+        [
+          {
+            "node": "Claude Direct Extract",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Restore Binary for Extract": {
+      "main": [
+        [
+          {
+            "node": "Submit Extract Job",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "timeSavedMode": "fixed",
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": true
+  },
+  "versionId": "8b5c6055-e9f6-4895-949c-087a25510c78",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "a3c54fc73499ecd51a1c26b8550eca4f05753c1657b4275386b482265431550a"
+  },
+  "id": "s0zRQONLkhfH3InA",
+  "tags": [
+    {
+      "updatedAt": "2026-04-07T14:33:46.346Z",
+      "createdAt": "2026-04-07T14:33:46.346Z",
+      "id": "67lbBILCN5VsxCR6",
+      "name": "Extraction Pipeline"
+    },
+    {
+      "updatedAt": "2026-04-06T19:53:19.254Z",
+      "createdAt": "2026-04-06T19:53:19.254Z",
+      "id": "SHXHjXd8j8At4VJY",
+      "name": "Production"
+    },
+    {
+      "updatedAt": "2026-04-06T19:53:19.304Z",
+      "createdAt": "2026-04-06T19:53:19.304Z",
+      "id": "VKMDZ5vDcbrZGvxE",
+      "name": "AI Extraction"
+    },
+    {
+      "updatedAt": "2026-04-06T19:53:19.280Z",
+      "createdAt": "2026-04-06T19:53:19.280Z",
+      "id": "Zn8G1SEoQ7a3MHGG",
+      "name": "PhaseAlpha"
+    },
+    {
+      "updatedAt": "2026-04-07T14:33:46.373Z",
+      "createdAt": "2026-04-07T14:33:46.373Z",
+      "id": "neGoWGpg7DW45Vl3",
+      "name": "v1.2"
+    }
+  ]
+}
